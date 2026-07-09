@@ -1,0 +1,6 @@
+numpy
+PyQt6
+pyqtgraph
+pyserial
+scikit-learn
+joblib
