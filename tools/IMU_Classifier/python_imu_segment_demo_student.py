@@ -24,6 +24,7 @@ from typing import Any
 
 DEFAULT_CLASS_NAMES = ("Task 1", "Task 2", "Task 3")
 DEFAULT_MODEL_PATH = Path("model_imu_student.joblib")
+DEFAULT_TRAINING_DATA_PATH = Path("training_data_imu_student.joblib")
 G_MPS2 = 9.80665
 FLOAT_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 SAMPLE_RE = re.compile(
@@ -34,6 +35,7 @@ SAMPLE_RE = re.compile(
 CHANNEL_NAMES = ("ax", "ay", "az", "gx", "gy", "gz")
 ACCEL_COLORS = ("#4C72B0", "#55A868", "#C44E52")
 GYRO_COLORS = ("#8172B3", "#CCB974", "#64B5CD")
+ImuSample = tuple[float, float, float, float, float, float, float]
 
 
 @dataclasses.dataclass
@@ -53,6 +55,7 @@ class DataInstance:
     sample_count: int
     duration_s: float
     captured_at: float = dataclasses.field(default_factory=time.time)
+    raw_samples: list[ImuSample] = dataclasses.field(default_factory=list)
 
 
 def missing_dependencies() -> list[str]:
@@ -88,6 +91,20 @@ def parse_sample(line: str) -> tuple[float, float, float, float, float, float] |
     if not match:
         return None
     return tuple(float(value) for value in match.groups())
+
+
+def normalize_imu_sample(sample: Any) -> ImuSample:
+    if len(sample) != 7:
+        raise ValueError("An IMU sample must contain timestamp, ax, ay, az, gx, gy, and gz.")
+    return (
+        float(sample[0]),
+        float(sample[1]),
+        float(sample[2]),
+        float(sample[3]),
+        float(sample[4]),
+        float(sample[5]),
+        float(sample[6]),
+    )
 
 
 class SerialImuInput:
@@ -138,7 +155,7 @@ class SerialImuInput:
             self._serial_port.close()
             self._serial_port = None
 
-    def latest_samples(self) -> tuple[list[tuple[float, float, float, float, float, float, float]], list[str]]:
+    def latest_samples(self) -> tuple[list[ImuSample], list[str]]:
         if self.demo_signal:
             return self._generate_demo_samples(), []
 
@@ -185,7 +202,7 @@ class SerialImuInput:
                 pass
             self._queue.put_nowait(item)
 
-    def _generate_demo_samples(self) -> list[tuple[float, float, float, float, float, float, float]]:
+    def _generate_demo_samples(self) -> list[ImuSample]:
         now = time.monotonic()
         if self._demo_last_sample_at is None:
             self._demo_last_sample_at = now
@@ -197,7 +214,7 @@ class SerialImuInput:
             samples.append(self._synthetic_sample(self._demo_last_sample_at))
         return samples
 
-    def _synthetic_sample(self, timestamp: float) -> tuple[float, float, float, float, float, float, float]:
+    def _synthetic_sample(self, timestamp: float) -> ImuSample:
         t = timestamp - self._demo_started_at
         demo_class = int(t // 8.0) % 3
         phase = 2.0 * math.pi * t
@@ -245,14 +262,15 @@ class ImuSegmentFeatureExtractor:
     def capture_instance(
         self,
         label: str | None,
-        samples: list[tuple[float, float, float, float, float, float, float]],
+        samples: list[ImuSample],
     ) -> DataInstance:
-        if len(samples) < self.min_segment_samples:
+        normalized_samples = [normalize_imu_sample(sample) for sample in samples]
+        if len(normalized_samples) < self.min_segment_samples:
             raise RuntimeError(
-                f"Need at least {self.min_segment_samples} IMU samples; got {len(samples)}."
+                f"Need at least {self.min_segment_samples} IMU samples; got {len(normalized_samples)}."
             )
 
-        data = self.np.asarray(samples, dtype="float32")
+        data = self.np.asarray(normalized_samples, dtype="float32")
         times = data[:, 0]
         values = data[:, 1:7]
         duration_s = float(times[-1] - times[0])
@@ -292,8 +310,9 @@ class ImuSegmentFeatureExtractor:
         return DataInstance(
             label=label,
             measurements=measurements,
-            sample_count=len(samples),
+            sample_count=len(normalized_samples),
             duration_s=duration_s,
+            raw_samples=normalized_samples,
         )
 
 
@@ -353,7 +372,7 @@ class MLClassifier:
 
 
 class ImuSegmentClassifierApp:
-    width = 900
+    width = 1040
     height = 560
 
     def __init__(self, deps: RuntimeDeps, args: argparse.Namespace) -> None:
@@ -367,6 +386,7 @@ class ImuSegmentClassifierApp:
         self.messagebox = messagebox
         self.class_names = tuple(args.classes)
         self.model_path = Path(args.model)
+        self.training_data_path = Path(args.training_data)
         self.training_data = {label: [] for label in self.class_names}
         self.class_index = 0
         self.classifier: MLClassifier | None = None
@@ -378,12 +398,12 @@ class ImuSegmentClassifierApp:
         self.log_captured = False
         self.status_text = "Starting"
         self.total_samples = 0
-        self.latest_sample: tuple[float, float, float, float, float, float, float] | None = None
-        self.history: collections.deque[tuple[float, float, float, float, float, float, float]] = collections.deque()
+        self.latest_sample: ImuSample | None = None
+        self.history: collections.deque[ImuSample] = collections.deque()
         self.recording = False
         self.record_request_time: float | None = None
         self.recording_label: str | None = None
-        self.recorded_samples: list[tuple[float, float, float, float, float, float, float]] = []
+        self.recorded_samples: list[ImuSample] = []
 
         self.imu_input = SerialImuInput(
             deps,
@@ -464,16 +484,18 @@ class ImuSegmentClassifierApp:
         self.class_select.grid(row=0, column=0, padx=(0, 8))
         self.class_select.bind("<<ComboboxSelected>>", self._class_selected)
 
-        self.status_label = ttk.Label(controls, text="", width=46, anchor="w")
+        self.status_label = ttk.Label(controls, text="", width=34, anchor="w")
         self.status_label.grid(row=0, column=1, sticky="ew")
 
         ttk.Button(controls, text=f"Capture {self.args.segment_seconds:g} s", command=self.start_capture).grid(row=0, column=2, padx=3)
         self.train_button = ttk.Button(controls, text="Train", command=self.toggle_classifier)
         self.train_button.grid(row=0, column=3, padx=3)
-        ttk.Button(controls, text="Save", command=self.save_model).grid(row=0, column=4, padx=3)
-        ttk.Button(controls, text="Load", command=self.load_model).grid(row=0, column=5, padx=3)
+        ttk.Button(controls, text="Save Model", command=self.save_model).grid(row=0, column=4, padx=3)
+        ttk.Button(controls, text="Load Model", command=self.load_model).grid(row=0, column=5, padx=3)
+        ttk.Button(controls, text="Save Data", command=self.save_training_data).grid(row=0, column=6, padx=3)
+        ttk.Button(controls, text="Load Data", command=self.load_training_data).grid(row=0, column=7, padx=3)
         self.log_button = ttk.Button(controls, text="Logger", command=self.toggle_logger)
-        self.log_button.grid(row=0, column=6, padx=(3, 0))
+        self.log_button.grid(row=0, column=8, padx=(3, 0))
 
         self.root.bind("<KeyPress>", self._key_pressed)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -557,7 +579,7 @@ class ImuSegmentClassifierApp:
         except Exception as exc:
             self._set_status(f"Save failed: {exc}")
             return
-        self._set_status(f"Saved {self.model_path}")
+        self._set_status(f"Saved model {self.model_path}")
 
     def load_model(self) -> None:
         if not self.model_path.exists():
@@ -580,7 +602,45 @@ class ImuSegmentClassifierApp:
         self.classification_window.clear()
         self.stable_classification = None
         self.train_button.configure(text="Collect")
-        self._set_status(f"Loaded {self.model_path}")
+        self._set_status(f"Loaded model {self.model_path}")
+
+    def save_training_data(self) -> None:
+        total_examples = sum(len(instances) for instances in self.training_data.values())
+        if total_examples == 0:
+            self._set_status("Capture data before saving.")
+            return
+
+        try:
+            self.training_data_path.parent.mkdir(parents=True, exist_ok=True)
+            self.deps.joblib.dump(self._training_data_payload(), self.training_data_path)
+        except Exception as exc:
+            self._set_status(f"Save data failed: {exc}")
+            return
+
+        self._set_status(f"Saved {total_examples} examples to {self.training_data_path}")
+
+    def load_training_data(self) -> None:
+        if self.recording:
+            self._set_status("Finish current capture before loading data.")
+            return
+        if not self.training_data_path.exists():
+            self._set_status(f"Missing {self.training_data_path}")
+            return
+
+        try:
+            payload = self.deps.joblib.load(self.training_data_path)
+            training_data = self._training_data_from_payload(payload)
+        except Exception as exc:
+            self._set_status(f"Load data failed: {exc}")
+            return
+
+        self.training_data = training_data
+        self.classifier = None
+        self.classification_window.clear()
+        self.stable_classification = None
+        self.train_button.configure(text="Train")
+        total_examples = sum(len(instances) for instances in self.training_data.values())
+        self._set_status(f"Loaded {total_examples} examples from {self.training_data_path}")
 
     def toggle_logger(self) -> None:
         if self.log_captured:
@@ -612,7 +672,7 @@ class ImuSegmentClassifierApp:
         self._redraw()
         self.root.after(max(1, int(1000 / self.args.fps)), self._tick)
 
-    def _handle_sample(self, sample: tuple[float, float, float, float, float, float, float]) -> None:
+    def _handle_sample(self, sample: ImuSample) -> None:
         timestamp = sample[0]
         self.latest_sample = sample
         self.total_samples += 1
@@ -679,7 +739,7 @@ class ImuSegmentClassifierApp:
         if self.log_captured and self.stable_classification is not None:
             self.detection_log.add(self.stable_classification)
 
-    def _latest_window_samples(self) -> list[tuple[float, float, float, float, float, float, float]]:
+    def _latest_window_samples(self) -> list[ImuSample]:
         if not self.history:
             return []
         end_time = self.history[-1][0]
@@ -711,7 +771,7 @@ class ImuSegmentClassifierApp:
 
     def _draw_panel(
         self,
-        samples: list[tuple[float, float, float, float, float, float, float]],
+        samples: list[ImuSample],
         *,
         title: str,
         y0: int,
@@ -840,6 +900,10 @@ class ImuSegmentClassifierApp:
             self.save_model()
         elif key == "l":
             self.load_model()
+        elif key == "d":
+            self.save_training_data()
+        elif key == "o":
+            self.load_training_data()
         elif key == "b":
             self.toggle_logger()
         elif key in {"c", " "} or event.keysym == "Return":
@@ -853,6 +917,92 @@ class ImuSegmentClassifierApp:
             "min_segment_coverage": float(self.args.min_segment_coverage),
             "feature_version": "student_no_stats_v1",
         }
+
+    def _training_data_payload(self) -> dict[str, Any]:
+        return {
+            "kind": "imu_segment_training_data",
+            "version": 1,
+            "class_names": self.class_names,
+            "feature_config": self._feature_config(),
+            "saved_at": time.time(),
+            "instances_by_label": {
+                label: [
+                    {
+                        "label": instance.label,
+                        "measurements": self.np.asarray(instance.measurements, dtype="float32"),
+                        "sample_count": int(instance.sample_count),
+                        "duration_s": float(instance.duration_s),
+                        "captured_at": float(instance.captured_at),
+                        "raw_samples": [
+                            normalize_imu_sample(sample)
+                            for sample in instance.raw_samples
+                        ],
+                    }
+                    for instance in self.training_data[label]
+                ]
+                for label in self.class_names
+            },
+        }
+
+    def _training_data_from_payload(self, payload: Any) -> dict[str, list[DataInstance]]:
+        if not isinstance(payload, dict) or payload.get("kind") != "imu_segment_training_data":
+            raise RuntimeError("File is not saved IMU training data.")
+
+        saved_class_names = tuple(payload.get("class_names", ()))
+        if saved_class_names != self.class_names:
+            raise RuntimeError(f"Data classes are {saved_class_names}, not {self.class_names}.")
+
+        saved_instances = payload.get("instances_by_label")
+        if not isinstance(saved_instances, dict):
+            raise RuntimeError("Saved training data is missing examples.")
+
+        saved_feature_config = dict(payload.get("feature_config", {}))
+        training_data: dict[str, list[DataInstance]] = {label: [] for label in self.class_names}
+        for label in self.class_names:
+            entries = saved_instances.get(label, [])
+            if not isinstance(entries, (list, tuple)):
+                raise RuntimeError(f"Saved examples for {label} are invalid.")
+            for index, entry in enumerate(entries, start=1):
+                training_data[label].append(
+                    self._instance_from_saved_entry(label, index, entry, saved_feature_config)
+                )
+        return training_data
+
+    def _instance_from_saved_entry(
+        self,
+        label: str,
+        index: int,
+        entry: Any,
+        saved_feature_config: dict[str, Any],
+    ) -> DataInstance:
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"Saved {label} example {index} is invalid.")
+
+        raw_samples = entry.get("raw_samples")
+        if raw_samples is not None and len(raw_samples) > 0:
+            try:
+                samples = [normalize_imu_sample(sample) for sample in raw_samples]
+                instance = self.features.capture_instance(label, samples)
+            except Exception as exc:
+                raise RuntimeError(f"Saved {label} example {index} cannot be rebuilt: {exc}") from exc
+        else:
+            if saved_feature_config != self._feature_config():
+                raise RuntimeError(
+                    "Saved data does not include raw samples and its feature settings do not match."
+                )
+            measurements = self.np.asarray(entry.get("measurements"), dtype="float32")
+            if measurements.ndim != 1:
+                raise RuntimeError(f"Saved {label} example {index} has invalid measurements.")
+            instance = DataInstance(
+                label=label,
+                measurements=measurements,
+                sample_count=int(entry.get("sample_count", 0)),
+                duration_s=float(entry.get("duration_s", 0.0)),
+            )
+
+        if entry.get("captured_at") is not None:
+            instance.captured_at = float(entry["captured_at"])
+        return instance
 
     def _set_status(self, value: str) -> None:
         self.status_text = value
@@ -877,6 +1027,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--min-segment-coverage", type=float, default=0.8, help="Minimum fraction of segment duration required")
     parser.add_argument("--min-samples-per-class", type=int, default=2, help="Training examples required for each class")
     parser.add_argument("--model", default=str(DEFAULT_MODEL_PATH))
+    parser.add_argument("--training-data", default=str(DEFAULT_TRAINING_DATA_PATH), help="Path for saved captured training examples")
     parser.add_argument("--vote-window", type=int, default=7)
     parser.add_argument("--vote-threshold", type=int, default=5)
     parser.add_argument("--classification-interval", type=float, default=0.25, help="Seconds between live classifications")

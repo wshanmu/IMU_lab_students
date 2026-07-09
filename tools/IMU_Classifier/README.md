@@ -63,7 +63,9 @@ python python_imu_segment_demo_student.py --demo-signal --classes Still,Shake,Tu
 5. Collect at least five examples for each class if time allows.
 6. Press `t` or `Train`.
 7. Perform a task again and watch the live classification.
-8. Press `s` to save the trained model, or `l` to load it later.
+8. Press `d` or `Save Data` to save the captured training examples.
+9. Press `s` to save the trained model, or `l` to load it later.
+10. In a later run, press `o` or `Load Data` to reload saved examples, then press `t` to train again.
 
 ## Controls
 
@@ -72,6 +74,8 @@ python python_imu_segment_demo_student.py --demo-signal --classes Still,Shake,Tu
 - `t`: train the classifier, or switch back to collection mode
 - `s`: save the trained model
 - `l`: load the saved model
+- `d`: save captured training examples
+- `o`: load captured training examples
 - `b`: toggle detection logging
 
 ## Student TODO
@@ -104,4 +108,6 @@ Suggested statistics:
 - Keep each task motion consistent while collecting training data.
 - Make sure every class has a similar number of examples.
 - If predictions are unstable, collect more examples or make the three tasks more different.
+- Saved training examples go to `training_data_imu_student.joblib` by default.
+- Use `--training-data my_examples.joblib` to choose a different training-data file.
 - Saved models only work with the same class names and feature settings used during training.
