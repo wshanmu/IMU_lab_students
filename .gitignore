@@ -83,3 +83,6 @@ tools/capture_trajectory_smoothed.py
 tools/IMU_Classifier/python_imu_segment_demo.py
 tools/IMU_Classifier/run_python.sh
 tools/IMU_Classifier/model_imu.joblib
+
+.vscode
+.devcontainer
